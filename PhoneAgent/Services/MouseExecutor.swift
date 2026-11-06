@@ -110,6 +110,16 @@ final class MouseExecutor {
         try await movePositionUnits(x: moveX - Int(current.x), y: moveY - Int(current.y))
         return CGPoint(x: moveX, y: moveY)
     }
+    /// Moves the pointer a few units and straight back, without pressing a button,
+    /// so iOS has changed pixels to deliver as a new captured frame. Every action
+    /// re-homes the pointer before positioning, so this cannot shift a later tap.
+    /// Returns false when the accessory cannot take a movement right now.
+    func nudgeForFreshFrame(units: Int = 6) async throws -> Bool {
+        guard ble.bufferedMotionReady, !calibrationInProgress, ble.status?.busy != true else { return false }
+        try await movePositionUnits(x: units, y: 0)
+        try await movePositionUnits(x: -units, y: 0)
+        return true
+    }
     func execute(_ action: AgentAction, frame: ScreenFrame, mappedHomeAvailable: Bool = false) async throws {
         try action.validate()
         guard ble.ready else { throw AgentError.message("鼠标未就绪，已停止执行") }
