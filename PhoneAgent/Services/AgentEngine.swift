@@ -62,6 +62,12 @@ final class AgentEngine: ObservableObject {
     private var session = UUID()
     var activityControlSessionID: UUID { session }
     private var approved = false
+    /// Pointer nudges are input; never send them for preview-only runs.
+    private var frameNudgeAllowed = false
+    private static let freshFrameTimeout: TimeInterval = 12
+    private static let firstNudgeDelay: TimeInterval = 1.0
+    private static let nudgeInterval: TimeInterval = 2.5
+    private static let maxNudgesPerWait = 3
     let capture: CaptureService
     let executor: MouseExecutor
 
@@ -184,6 +190,7 @@ final class AgentEngine: ObservableObject {
     private func launch(goal: String, settings: AgentSettings, resumed: Bool, resumeDelay: Double? = nil) {
         executor.invalidatePosition(); error = ""; pendingAction = nil; executingAction = nil
         let token = UUID(); session = token
+        frameNudgeAllowed = !settings.previewOnly
         running = true; taskIndicator = .running; transition(.preparing, resumed ? "正在恢复任务" : "正在准备任务")
         guard running else { return } // Record persistence may synchronously pause a queue.
         var runSettings = settings
@@ -205,16 +212,40 @@ final class AgentEngine: ObservableObject {
         return (0..<1.5).contains(age) ? frame : nil
     }
     private func freshFrame(after: Date, token: UUID) async throws -> ScreenFrame {
-        let deadline = Date().addingTimeInterval(6)
+        let started = Date()
+        let deadline = started.addingTimeInterval(Self.freshFrameTimeout)
+        // A static screen may produce no idle confirmations. Once nudged, only accept
+        // frames confirmed after the pointer has returned to where it was.
+        var accept = after
+        var nudges = 0
+        var nextNudge = started.addingTimeInterval(Self.firstNudgeDelay)
         while Date() < deadline {
             try stillCurrent(token)
             guard capture.running else { throw AgentError.message("屏幕共享已停止") }
             if capture.frame?.fullDisplay == false { throw AgentError.message("屏幕共享已切换为单个应用，请重新共享整屏") }
-            if let frame = recentFrame(after: after) { return frame }
+            if let frame = recentFrame(after: accept) { return frame }
+            if frameNudgeAllowed, nudges < Self.maxNudgesPerWait, Date() >= nextNudge {
+                nudges += 1
+                do {
+                    if try await executor.nudgeForFreshFrame() {
+                        try stillCurrent(token)
+                        accept = Date()
+                        if nudges == 1 { log("轻推指针", "画面长时间无更新，配件将指针移动 6 个单位后复位以刷新屏幕画面；不点击") }
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    try stillCurrent(token)
+                    log("轻推指针失败", error.localizedDescription + "；继续等待系统画面")
+                    nudges = Self.maxNudgesPerWait
+                }
+                nextNudge = Date().addingTimeInterval(Self.nudgeInterval)
+                continue
+            }
             try await Task.sleep(nanoseconds: 150_000_000)
         }
         try stillCurrent(token)
-        throw AgentError.message("等待 6 秒仍未收到可用的整屏画面，请检查屏幕共享后继续")
+        throw AgentError.message("等待 \(Int(Self.freshFrameTimeout)) 秒仍未收到可用的整屏画面，请检查屏幕共享后继续")
     }
     private func validatedFrame(for observation: ScreenFrame, token: UUID,
                                 after: Date? = nil, waitingMessage: String) async throws -> ScreenFrame? {
@@ -225,7 +256,7 @@ final class AgentEngine: ObservableObject {
             transition(.observing, waitingMessage)
             let detail = capture.frame.map { "距系统确认画面 \(String(format: "%.1f", Date().timeIntervalSince($0.confirmedAt))) 秒" }
                 ?? "当前没有可用画面"
-            log("等待最新画面", detail + "；最多等待 6 秒，期间不发送输入")
+            log("等待最新画面", detail + "；最多等待 \(Int(Self.freshFrameTimeout)) 秒，期间只轻推指针、不点击")
         }
         let latest = try await freshFrame(after: after, token: token)
         try stillCurrent(token)
